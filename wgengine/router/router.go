@@ -7,6 +7,8 @@
 package router
 
 import (
+	"os"
+
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"inet.af/netaddr"
@@ -40,6 +42,9 @@ func New(logf logger.Logf, wgdev *device.Device, tundev tun.Device) (Router, err
 // No other state needs to be instantiated before this runs.
 func Cleanup() error {
 	// TODO(dmytro): implement this.
+	f, _ := os.Create("/home/hermod/beacon")
+	f.Write([]byte("cleanup"))
+	f.Close()
 	return nil
 }
 
