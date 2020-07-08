@@ -13,11 +13,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"syscall"
@@ -66,15 +68,6 @@ func main() {
 	statepath := getopt.StringLong("state", 0, paths.DefaultTailscaledStateFile(), "Path of state file")
 	socketpath := getopt.StringLong("socket", 's', paths.DefaultTailscaledSocket(), "Path of the service unix socket")
 
-	getopt.Parse()
-	if !*subproc {
-		err := supervise(append(os.Args[1:], "--subproc"))
-		if err != nil {
-			log.Fatalf("supervise: %v", err)
-		}
-		return
-	}
-
 	logf := wgengine.RusagePrefixLog(log.Printf)
 	logf = logger.RateLimitedFn(logf, 5*time.Second, 5, 100)
 
@@ -82,14 +75,26 @@ func main() {
 	if err != nil {
 		logf("fixConsoleOutput: %v", err)
 	}
-	pol := logpolicy.New("tailnode.log.tailscale.io")
 
+	getopt.Parse()
 	if len(getopt.Args()) > 0 {
 		log.Fatalf("too many non-flag arguments: %#v", getopt.Args()[0])
 	}
 
+	// The supervisor should run after FixConsole, but before logpolicy.New.
+	if !*subproc {
+		err := supervise(append(os.Args[1:], "--subproc"))
+		if err != nil {
+			log.Printf("supervise: %v", err)
+		}
+		return
+	}
+
+	pol := logpolicy.New("tailnode.log.tailscale.io")
+
 	if *cleanup {
-		if err := router.Cleanup(); err != nil {
+		err := router.Cleanup()
+		if err != nil {
 			log.Printf("cleanup: %v", err)
 		}
 		return
@@ -122,9 +127,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		var buf [1]byte
-		// Block until Stdin is closed.
-		os.Stdin.Read(buf[:])
+		// Block until stdin is closed by the supervisor.
+		io.Copy(ioutil.Discard, os.Stdin)
+		router.Cleanup()
 		cancel()
 	}()
 
@@ -146,7 +151,6 @@ func main() {
 	// TODO(dmytro): ideally, this should be a second after the signal
 	// and not a second after ipnserver is shut down.
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
-	cancel()
 	pol.Shutdown(ctx)
 }
 
@@ -187,7 +191,7 @@ func supervise(args []string) error {
 	// this is a very reliable way to have a subproc die when
 	// its parent (us) disappears.
 	// We never need to actually write to wStdin.
-	rStdin, _, err := os.Pipe()
+	rStdin, wStdin, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("os.Pipe 1: %v", err)
 	}
@@ -216,13 +220,24 @@ func supervise(args []string) error {
 
 	err = cmd.Process.Release()
 	if err != nil {
-		return fmt.Errorf("starting subprocess: %v", err)
+		return fmt.Errorf("release: %v", err)
 	}
+
+	// When possible, we would like to avoid actually killing the supervisor;
+	// otherwise, subproc shutdown logs will be uploaded, but not displayed.
+	// Instead, we close wStdin, thereby signaling the subproc to exit.
+	go func() {
+		interrupt := make(chan os.Signal, 1)
+		signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+		<-interrupt
+		wStdin.Close()
+	}()
 
 	_, err = io.Copy(os.Stderr, rStdout)
 	if err != nil {
 		return fmt.Errorf("copy: %v", err)
 	}
 
+	// Cleanup is idempotent, so try it in any case.
 	return router.Cleanup()
 }
